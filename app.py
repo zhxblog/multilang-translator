@@ -233,6 +233,59 @@ def build_excel(original_bytes: bytes, translations: dict[str, dict[str, str]]) 
     return out.getvalue()
 
 
+# 文字模式专用：从零构建包含全部 44 种语言列的 Excel
+ALL_LANG_ORDER = [
+    "en","de","fr","ru","pt","ko","ja","es","ar","it",
+    "bn","da","idn","th","vi","tr","nl","pl","zh_HN","w",
+    "ee","fi","el","hu","gg","hr","ga","ro","lv","mt",
+    "sk","si","sv","lt","ml","bur","kh","la","ph","fa",
+    "uk","ta","mn","kk",
+]
+
+def build_excel_from_texts(zh_texts: list, translations: dict) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "翻译结果"
+
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    center      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # 构建列顺序：zh_CN + 44 种目标语言
+    columns = ["zh_CN"] + [c for c in ALL_LANG_ORDER if c in LANGUAGE_MAP]
+
+    for col_i, code in enumerate(columns, 1):
+        c1 = ws.cell(row=1, column=col_i)
+        c1.value = code
+        c1.fill = header_fill; c1.font = header_font; c1.alignment = center
+
+        c2 = ws.cell(row=2, column=col_i)
+        c2.value = "中文简体" if code == "zh_CN" else LANG_NAMES_ZH.get(code, code)
+        c2.fill = header_fill; c2.font = header_font; c2.alignment = center
+
+    for row_i, zh in enumerate(zh_texts, 3):
+        ws.cell(row=row_i, column=1).value = zh
+        trans = translations.get(zh, {})
+        for col_i, code in enumerate(columns[1:], 2):
+            v = trans.get(code, "")
+            if v:
+                cell = ws.cell(row=row_i, column=col_i)
+                cell.value = v
+                cell.alignment = Alignment(wrap_text=True, vertical="center")
+
+    for col in ws.columns:
+        max_len = max((len(str(c.value)) for c in col if c.value), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max(max_len + 2, 10), 40)
+
+    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[2].height = 22
+    ws.freeze_panes = "B3"
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_CONTENT
@@ -241,55 +294,74 @@ async def index():
 @app.post("/translate-stream")
 async def translate_stream(request: Request):
     form = await request.form()
-    api_key  = form.get("api_key", "").strip()
-    provider = form.get("provider", "aliyun_coding").strip()
-    model    = form.get("model", "").strip()
-    file     = form.get("file")
+    api_key    = form.get("api_key", "").strip()
+    provider   = form.get("provider", "aliyun_coding").strip()
+    model      = form.get("model", "").strip()
+    file       = form.get("file")
+    texts_json = form.get("texts", "").strip()   # 文字模式：JSON 数组
 
     if not api_key:
         raise HTTPException(400, "请提供 API Key")
-    if not file:
-        raise HTTPException(400, "请上传 Excel 文件")
+
+    # 判断输入模式
+    use_text_mode = False
+    file_bytes    = None
+    direct_texts  = []
+
+    if file and getattr(file, "filename", ""):
+        file_bytes = await file.read()
+    elif texts_json:
+        try:
+            direct_texts = [t.strip() for t in json.loads(texts_json) if str(t).strip()]
+        except Exception:
+            raise HTTPException(400, "texts 参数格式错误，需为 JSON 字符串数组")
+        if not direct_texts:
+            raise HTTPException(400, "请至少输入一条中文文字")
+        use_text_mode = True
+    else:
+        raise HTTPException(400, "请上传 Excel 文件或在文字模式中输入内容")
 
     # Default models
     defaults = {"anthropic": "claude-sonnet-4-6", "aliyun_coding": "qwen3.5-plus", "aliyun": "qwen-plus"}
     if not model:
         model = defaults.get(provider, "qwen3.5-plus")
 
-    file_bytes = await file.read()
-
     async def gen():
         try:
-            yield f"data: {json.dumps({'type': 'status', 'message': '正在解析 Excel 文件...'})}\n\n"
+            if use_text_mode:
+                # ── 文字模式 ──────────────────────────────────────────
+                zh_texts    = direct_texts
+                target_langs = [c for c in ALL_LANG_ORDER if c in LANGUAGE_MAP]
+                yield f"data: {json.dumps({'type': 'status', 'message': f'文字模式：共 {len(zh_texts)} 条，翻译为 {len(target_langs)} 种语言...'})}\n\n"
+            else:
+                # ── 文件模式（原有逻辑） ───────────────────────────────
+                yield f"data: {json.dumps({'type': 'status', 'message': '正在解析 Excel 文件...'})}\n\n"
 
-            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
-            zh_col_idx = 0
-            for i in range(len(df.columns)):
-                v = str(df.iloc[0, i]) if pd.notna(df.iloc[0, i]) else ""
-                if v in ("中文简体", "zh_CN"):
-                    zh_col_idx = i
-                    break
-
-            # Row 0: column codes (zh_CN, en, ...)
-            # Row 1: column labels (中文简体, 英语, ...) — skip this header label row
-            # Row 2+: actual content to translate
-            zh_texts = [
-                str(df.iloc[r, zh_col_idx]).strip()
-                for r in range(2, len(df))
-                if pd.notna(df.iloc[r, zh_col_idx]) and str(df.iloc[r, zh_col_idx]).strip()
-            ]
-
-            # Check both row 0 (codes like "en") and row 1 (Chinese names like "英语")
-            existing_codes = []
-            for col_i in range(len(df.columns)):
-                h0 = str(df.iloc[0, col_i]) if pd.notna(df.iloc[0, col_i]) else ""
-                h1 = str(df.iloc[1, col_i]) if len(df) > 1 and pd.notna(df.iloc[1, col_i]) else ""
-                for code in LANGUAGE_MAP:
-                    if h0 == code or h1 == LANG_NAMES_ZH.get(code, "") or h0 == LANG_NAMES_ZH.get(code, ""):
-                        existing_codes.append(code)
+                df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
+                zh_col_idx = 0
+                for i in range(len(df.columns)):
+                    v = str(df.iloc[0, i]) if pd.notna(df.iloc[0, i]) else ""
+                    if v in ("中文简体", "zh_CN"):
+                        zh_col_idx = i
                         break
-            target_langs = [c for c in existing_codes if c in LANGUAGE_MAP]
 
+                zh_texts = [
+                    str(df.iloc[r, zh_col_idx]).strip()
+                    for r in range(2, len(df))
+                    if pd.notna(df.iloc[r, zh_col_idx]) and str(df.iloc[r, zh_col_idx]).strip()
+                ]
+
+                existing_codes = []
+                for col_i in range(len(df.columns)):
+                    h0 = str(df.iloc[0, col_i]) if pd.notna(df.iloc[0, col_i]) else ""
+                    h1 = str(df.iloc[1, col_i]) if len(df) > 1 and pd.notna(df.iloc[1, col_i]) else ""
+                    for code in LANGUAGE_MAP:
+                        if h0 == code or h1 == LANG_NAMES_ZH.get(code, "") or h0 == LANG_NAMES_ZH.get(code, ""):
+                            existing_codes.append(code)
+                            break
+                target_langs = [c for c in existing_codes if c in LANGUAGE_MAP]
+
+            # ── 共用翻译循环 ──────────────────────────────────────────
             total = len(zh_texts)
             provider_label = {"aliyun_coding": "阿里云 Coding Plan", "aliyun": "阿里云 DashScope"}.get(provider, "Anthropic Claude")
             yield f"data: {json.dumps({'type': 'status', 'message': f'使用 {provider_label} ({model})，共 {total} 条文本，翻译为 {len(target_langs)} 种语言...'})}\n\n"
@@ -310,7 +382,6 @@ async def translate_stream(request: Request):
                     yield f"data: {json.dumps({'type': 'translated', 'text': text, 'langs': len(trans)})}\n\n"
                 except Exception as e:
                     err_msg = str(e)
-                    # 鉴权失败立即中止，不继续浪费请求
                     is_auth_error = any(kw in err_msg for kw in (
                         "401", "invalid_api_key", "Incorrect API key",
                         "AuthenticationError", "authentication_error",
@@ -332,7 +403,13 @@ async def translate_stream(request: Request):
                 return
 
             yield f"data: {json.dumps({'type': 'status', 'message': f'翻译完成（成功 {success_count}/{total} 条），正在生成 Excel...'})}\n\n"
-            output_bytes = build_excel(file_bytes, all_translations)
+
+            # ── 生成 Excel ─────────────────────────────────────────────
+            if use_text_mode:
+                output_bytes = build_excel_from_texts(zh_texts, all_translations)
+            else:
+                output_bytes = build_excel(file_bytes, all_translations)
+
             encoded = base64.b64encode(output_bytes).decode()
             yield f"data: {json.dumps({'type': 'done', 'file': encoded, 'filename': '翻译结果.xlsx'})}\n\n"
 
@@ -392,7 +469,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   .form-group { margin-bottom: 1.25rem; }
   label { display: block; font-size: .875rem; font-weight: 500; margin-bottom: .4rem; }
 
-  /* Provider tabs */
+  /* Tabs (provider + input mode) */
   .tabs { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
   .tab {
     flex: 1; padding: .6rem 1rem; border-radius: 8px; border: 2px solid var(--border);
@@ -402,6 +479,17 @@ HTML_CONTENT = """<!DOCTYPE html>
   .tab:hover { border-color: var(--primary); color: var(--primary); }
   .tab.active { border-color: var(--primary); background: rgba(79,70,229,.07); color: var(--primary); }
   .tab .tab-icon { font-size: 1.2rem; display: block; margin-bottom: .2rem; }
+
+  /* Input mode tabs (smaller) */
+  .mode-tabs { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
+  .mode-tab {
+    flex: 1; padding: .55rem .75rem; border-radius: 8px; border: 1.5px solid var(--border);
+    background: var(--surface); cursor: pointer; font-size: .875rem; font-weight: 500;
+    color: var(--muted); transition: all .15s; text-align: center; display: flex;
+    align-items: center; justify-content: center; gap: .4rem;
+  }
+  .mode-tab:hover { border-color: var(--primary); color: var(--primary); }
+  .mode-tab.active { border-color: var(--primary); background: rgba(79,70,229,.07); color: var(--primary); }
 
   input[type="text"], input[type="password"], select {
     width: 100%; padding: .625rem .875rem; border: 1px solid var(--border);
@@ -413,15 +501,36 @@ HTML_CONTENT = """<!DOCTYPE html>
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(79,70,229,.12);
   }
-  .api-key-wrap { position: relative; }
-  .toggle-key {
-    position: absolute; right: .75rem; top: 50%; transform: translateY(-50%);
-    background: none; border: none; cursor: pointer; color: var(--muted); font-size: .8rem;
+  textarea {
+    width: 100%; padding: .75rem .875rem; border: 1px solid var(--border);
+    border-radius: 8px; font-size: .9rem; outline: none; resize: vertical;
+    font-family: inherit; min-height: 140px; line-height: 1.6;
+    transition: border-color .15s, box-shadow .15s;
+    background: var(--surface); color: var(--text);
   }
+  textarea:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(79,70,229,.12);
+  }
+  .api-key-wrap { position: relative; display: flex; gap: .5rem; }
+  .api-key-wrap input { flex: 1; }
+  .toggle-key {
+    background: none; border: 1px solid var(--border); border-radius: 7px;
+    cursor: pointer; color: var(--muted); font-size: .8rem; padding: 0 .75rem;
+    white-space: nowrap; transition: all .15s;
+  }
+  .toggle-key:hover { border-color: var(--primary); color: var(--primary); }
+  .preset-key-btn {
+    background: rgba(79,70,229,.07); border: 1.5px solid rgba(79,70,229,.3);
+    border-radius: 7px; cursor: pointer; color: var(--primary); font-size: .8rem;
+    padding: 0 .875rem; white-space: nowrap; font-weight: 500; transition: all .15s;
+  }
+  .preset-key-btn:hover { background: rgba(79,70,229,.14); }
   .hint { font-size: .78rem; color: var(--muted); margin-top: .35rem; }
   a.link { color: var(--primary); text-decoration: none; }
   a.link:hover { text-decoration: underline; }
 
+  /* File drop zone */
   .drop-zone {
     border: 2px dashed var(--border); border-radius: 10px;
     padding: 2rem; text-align: center; cursor: pointer;
@@ -443,6 +552,11 @@ HTML_CONTENT = """<!DOCTYPE html>
   .file-name { flex: 1; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .file-size { color: var(--muted); font-size: .8rem; }
   .file-rm { background: none; border: none; cursor: pointer; color: var(--error); font-size: 1rem; }
+
+  /* Text input area */
+  .text-input-area { display: none; }
+  .text-input-area.active { display: block; }
+  .text-count { font-size: .8rem; color: var(--muted); margin-top: .4rem; text-align: right; }
 
   .langs-grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
@@ -491,6 +605,31 @@ HTML_CONTENT = """<!DOCTYPE html>
   .result-card h3 { font-size: 1.2rem; margin-bottom: .5rem; }
   .result-card p { color: var(--muted); font-size: .875rem; }
 
+  /* Password modal */
+  .pw-modal-overlay {
+    display: none; position: fixed; inset: 0; z-index: 999;
+    background: rgba(0,0,0,.45); backdrop-filter: blur(4px);
+    align-items: center; justify-content: center;
+  }
+  .pw-modal-overlay.show { display: flex; }
+  .pw-modal {
+    background: white; border-radius: 14px; padding: 2rem;
+    width: 340px; max-width: 94vw; box-shadow: 0 20px 60px rgba(0,0,0,.2);
+  }
+  .pw-modal h3 { font-size: 1.05rem; font-weight: 700; margin-bottom: .4rem; }
+  .pw-modal p { font-size: .85rem; color: var(--muted); margin-bottom: 1.25rem; }
+  .pw-modal input {
+    margin-bottom: .75rem; letter-spacing: .1em;
+  }
+  .pw-modal-btns { display: flex; gap: .6rem; }
+  .pw-modal-btns button { flex: 1; padding: .65rem; border-radius: 8px; font-size: .9rem;
+    font-weight: 600; cursor: pointer; border: none; }
+  .pw-confirm { background: var(--primary); color: white; }
+  .pw-confirm:hover { background: var(--primary-hover); }
+  .pw-cancel { background: var(--bg); color: var(--muted); border: 1px solid var(--border) !important; }
+  .pw-err { font-size: .8rem; color: var(--error); margin-bottom: .6rem; display: none; }
+  .pw-err.show { display: block; }
+
   @media (max-width: 480px) {
     .header h1 { font-size: 1.5rem; }
     .card { padding: 1.25rem; }
@@ -501,7 +640,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 <div class="container">
   <div class="header">
     <h1>🌐 多语言翻译插件</h1>
-    <p>上传 Excel 文件，一键翻译为 44 种语言</p>
+    <p>支持上传 Excel 文件 / 直接输入中文文字，一键翻译为 44 种语言</p>
   </div>
 
   <!-- Provider & API -->
@@ -533,27 +672,47 @@ HTML_CONTENT = """<!DOCTYPE html>
       <label for="apiKey" id="key-label">API Key</label>
       <div class="api-key-wrap">
         <input type="password" id="apiKey" placeholder="" autocomplete="off">
-        <button class="toggle-key" onclick="toggleKey()">👁</button>
+        <button class="toggle-key" onclick="toggleKey()" title="显示/隐藏">👁 显示</button>
+        <button class="preset-key-btn" onclick="showPwModal()" title="使用预设密钥">🔑 预设</button>
       </div>
       <p class="hint" id="key-hint"></p>
     </div>
   </div>
 
-  <!-- File Upload -->
+  <!-- Input mode toggle -->
   <div class="card">
-    <div class="card-title">上传文件</div>
-    <div class="drop-zone" id="dropZone"
-         ondragover="onDragOver(event)" ondragleave="onDragLeave()" ondrop="onDrop(event)">
-      <input type="file" id="fileInput" accept=".xlsx,.xls" onchange="onFileSelect(this)">
-      <div class="drop-icon">📊</div>
-      <p>拖放 Excel 文件到这里，或 <span>点击选择</span></p>
-      <p style="margin-top:.35rem;font-size:.8rem">支持 .xlsx / .xls</p>
+    <div class="card-title">输入方式</div>
+    <div class="mode-tabs">
+      <div class="mode-tab active" id="mode-file" onclick="switchMode('file')">
+        📁 上传 Excel 文件
+      </div>
+      <div class="mode-tab" id="mode-text" onclick="switchMode('text')">
+        ✏️ 输入中文文字
+      </div>
     </div>
-    <div class="file-info" id="fileInfo">
-      <span>📄</span>
-      <span class="file-name" id="fileName"></span>
-      <span class="file-size" id="fileSize"></span>
-      <button class="file-rm" onclick="removeFile()">✕</button>
+
+    <!-- File upload panel -->
+    <div id="panel-file">
+      <div class="drop-zone" id="dropZone"
+           ondragover="onDragOver(event)" ondragleave="onDragLeave()" ondrop="onDrop(event)">
+        <input type="file" id="fileInput" accept=".xlsx,.xls" onchange="onFileSelect(this)">
+        <div class="drop-icon">📊</div>
+        <p>拖放 Excel 文件到这里，或 <span>点击选择</span></p>
+        <p style="margin-top:.35rem;font-size:.8rem">支持 .xlsx / .xls，表格结构保持不变</p>
+      </div>
+      <div class="file-info" id="fileInfo">
+        <span>📄</span>
+        <span class="file-name" id="fileName"></span>
+        <span class="file-size" id="fileSize"></span>
+        <button class="file-rm" onclick="removeFile()">✕</button>
+      </div>
+    </div>
+
+    <!-- Text input panel -->
+    <div id="panel-text" style="display:none;">
+      <label style="margin-bottom:.5rem">输入中文文字 <span style="color:var(--muted);font-weight:400">（每行一条，翻译为全部 44 种语言）</span></label>
+      <textarea id="textInput" placeholder="每行输入一条中文词汇或短语，例如：\\n产品名称\\n立即购买\\n联系我们\\n免费试用 14 天" oninput="updateTextCount()"></textarea>
+      <div class="text-count" id="textCount">0 条</div>
     </div>
   </div>
 
@@ -590,6 +749,22 @@ HTML_CONTENT = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Password modal -->
+<div class="pw-modal-overlay" id="pwOverlay" onclick="if(event.target===this)hidePwModal()">
+  <div class="pw-modal">
+    <h3>🔑 查看预设 API Key</h3>
+    <p>请输入管理员密码以使用预设密钥</p>
+    <input type="password" id="pwInput" placeholder="请输入密码"
+           onkeydown="if(event.key==='Enter')confirmPw()"
+           oninput="document.getElementById('pwErr').classList.remove('show')">
+    <div class="pw-err" id="pwErr">密码错误，请重试</div>
+    <div class="pw-modal-btns">
+      <button class="pw-cancel" onclick="hidePwModal()">取消</button>
+      <button class="pw-confirm" onclick="confirmPw()">确认</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const PROVIDERS = {
   aliyun_coding: {
@@ -597,7 +772,7 @@ const PROVIDERS = {
     placeholder: 'sk-sp-...',
     hint: '在阿里云 Coding Plan 控制台「套餐专属 API Key」处复制，Base URL 已自动设置为 <code>https://coding.dashscope.aliyuncs.com/v1</code>',
     models: [
-      { value: 'qwen3.5-plus',        label: 'qwen3.5-plus（推荐，支持视觉）' },
+      { value: 'qwen3.5-plus',         label: 'qwen3.5-plus（推荐，支持视觉）' },
       { value: 'qwen3-max-2026-01-23', label: 'qwen3-max-2026-01-23（最强）' },
       { value: 'qwen3-coder-plus',     label: 'qwen3-coder-plus（编程优化）' },
       { value: 'qwen3-coder-next',     label: 'qwen3-coder-next（编程优化）' },
@@ -607,6 +782,8 @@ const PROVIDERS = {
       { value: 'MiniMax-M2.5',        label: 'MiniMax-M2.5' },
     ],
     modelHint: '翻译任务推荐 qwen3.5-plus，速度快质量好；qwen3-max 效果最强',
+    // 预设密钥（仅对应此 provider，密码解锁后填入）
+    presetKey: true,
   },
   aliyun: {
     label: 'API Key（标准 DashScope）',
@@ -624,8 +801,8 @@ const PROVIDERS = {
     placeholder: 'sk-ant-...',
     hint: '在 Anthropic 控制台获取：<a class="link" href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a>',
     models: [
-      { value: 'claude-opus-4-6',          label: 'claude-opus-4-6（最强）' },
-      { value: 'claude-sonnet-4-6',        label: 'claude-sonnet-4-6（推荐）' },
+      { value: 'claude-opus-4-6',           label: 'claude-opus-4-6（最强）' },
+      { value: 'claude-sonnet-4-6',         label: 'claude-sonnet-4-6（推荐）' },
       { value: 'claude-haiku-4-5-20251001', label: 'claude-haiku-4-5（最快）' },
     ],
     modelHint: 'Sonnet 翻译质量与速度平衡最佳',
@@ -644,44 +821,83 @@ const LANGUAGES = [
   ["uk","乌克兰语"],["ta","泰米尔语"],["mn","蒙古语"],["kk","哈萨克语"]
 ];
 
-let currentProvider = 'aliyun';
-let selectedFile = null;
-let resultBlob = null;
+let currentProvider = 'aliyun_coding';
+let currentMode     = 'file';   // 'file' | 'text'
+let selectedFile    = null;
+let resultBlob      = null;
 
-// Init language tags
+// ── 预设 Key（分段存储，密码解锁后拼合）──
+const _kp = ['sk','-','sp','-','bf1c0d93','e56b','4f7e','a55d','9ae8','9fb0','13ef'];
+function _assembleKey() { return _kp.join(''); }
+
+// ── Init language tags ──
 const grid = document.getElementById('langsGrid');
 LANGUAGES.forEach(([, name]) => {
   const t = document.createElement('div');
-  t.className = 'lang-tag';
-  t.textContent = name;
+  t.className = 'lang-tag'; t.textContent = name;
   grid.appendChild(t);
 });
 
+// ── Provider switching ──
 function switchProvider(p) {
   currentProvider = p;
   ['aliyun_coding', 'aliyun', 'anthropic'].forEach(id => {
-    const el = document.getElementById('tab-' + id);
-    if (el) el.classList.toggle('active', p === id);
+    document.getElementById('tab-' + id)?.classList.toggle('active', p === id);
   });
-
   const cfg = PROVIDERS[p];
-  document.getElementById('key-label').textContent = cfg.label;
-  document.getElementById('apiKey').placeholder = cfg.placeholder;
-  document.getElementById('key-hint').innerHTML = cfg.hint;
-  document.getElementById('model-hint').textContent = cfg.modelHint;
-
-  const sel = document.getElementById('modelSelect');
-  sel.innerHTML = cfg.models.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
+  document.getElementById('key-label').textContent  = cfg.label;
+  document.getElementById('apiKey').placeholder      = cfg.placeholder;
+  document.getElementById('key-hint').innerHTML      = cfg.hint;
+  document.getElementById('model-hint').textContent  = cfg.modelHint;
+  document.getElementById('modelSelect').innerHTML   =
+    cfg.models.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
+  // 只有 aliyun_coding 才有预设 Key 按钮
+  document.querySelector('.preset-key-btn').style.display =
+    cfg.presetKey ? '' : 'none';
 }
-
-// Init
 switchProvider('aliyun_coding');
 
-function toggleKey() {
-  const i = document.getElementById('apiKey');
-  i.type = i.type === 'password' ? 'text' : 'password';
+// ── Mode switching ──
+function switchMode(m) {
+  currentMode = m;
+  ['file','text'].forEach(id => {
+    document.getElementById('mode-' + id)?.classList.toggle('active', id === m);
+    document.getElementById('panel-' + id).style.display = (id === m) ? '' : 'none';
+  });
 }
 
+// ── Key toggle ──
+function toggleKey() {
+  const i = document.getElementById('apiKey');
+  const btn = document.querySelector('.toggle-key');
+  if (i.type === 'password') { i.type = 'text';     btn.textContent = '🙈 隐藏'; }
+  else                       { i.type = 'password'; btn.textContent = '👁 显示'; }
+}
+
+// ── Password modal ──
+function showPwModal() {
+  document.getElementById('pwInput').value = '';
+  document.getElementById('pwErr').classList.remove('show');
+  document.getElementById('pwOverlay').classList.add('show');
+  setTimeout(() => document.getElementById('pwInput').focus(), 80);
+}
+function hidePwModal() {
+  document.getElementById('pwOverlay').classList.remove('show');
+}
+function confirmPw() {
+  const pw = document.getElementById('pwInput').value;
+  if (pw === 'zhx230221') {
+    document.getElementById('apiKey').value = _assembleKey();
+    document.getElementById('apiKey').type  = 'password';
+    document.querySelector('.toggle-key').textContent = '👁 显示';
+    hidePwModal();
+  } else {
+    document.getElementById('pwErr').classList.add('show');
+    document.getElementById('pwInput').select();
+  }
+}
+
+// ── File ops ──
 function onDragOver(e) { e.preventDefault(); document.getElementById('dropZone').classList.add('drag-over'); }
 function onDragLeave() { document.getElementById('dropZone').classList.remove('drag-over'); }
 function onDrop(e) { e.preventDefault(); onDragLeave(); if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); }
@@ -689,7 +905,7 @@ function onFileSelect(i) { if (i.files[0]) setFile(i.files[0]); }
 function setFile(f) {
   selectedFile = f;
   document.getElementById('fileName').textContent = f.name;
-  document.getElementById('fileSize').textContent = fmt(f.size);
+  document.getElementById('fileSize').textContent  = fmt(f.size);
   document.getElementById('fileInfo').classList.add('show');
 }
 function removeFile() {
@@ -703,26 +919,49 @@ function fmt(b) {
   return (b/1048576).toFixed(1) + ' MB';
 }
 
+// ── Text count ──
+function updateTextCount() {
+  const lines = document.getElementById('textInput').value
+    .split('\\n').filter(l => l.trim()).length;
+  document.getElementById('textCount').textContent = lines + ' 条';
+}
+
+// ── Log ──
 function log(msg, type='info') {
   const box = document.getElementById('logBox');
   const d = document.createElement('div');
   d.className = 'log-line ' + type;
   d.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
-  box.appendChild(d);
-  box.scrollTop = box.scrollHeight;
+  box.appendChild(d); box.scrollTop = box.scrollHeight;
 }
 
 function setProgress(cur, tot) {
   const pct = tot > 0 ? Math.round(cur/tot*100) : 0;
-  document.getElementById('progressBar').style.width = pct + '%';
+  document.getElementById('progressBar').style.width  = pct + '%';
   document.getElementById('progressCount').textContent = cur + ' / ' + tot;
 }
 
+// ── Start translation ──
 async function startTranslation() {
   const apiKey = document.getElementById('apiKey').value.trim();
   const model  = document.getElementById('modelSelect').value;
   if (!apiKey) { alert('请输入 API Key'); return; }
-  if (!selectedFile) { alert('请选择 Excel 文件'); return; }
+
+  const fd = new FormData();
+  fd.append('api_key',  apiKey);
+  fd.append('provider', currentProvider);
+  fd.append('model',    model);
+
+  if (currentMode === 'file') {
+    if (!selectedFile) { alert('请选择 Excel 文件'); return; }
+    fd.append('file', selectedFile);
+  } else {
+    const raw = document.getElementById('textInput').value.trim();
+    if (!raw) { alert('请输入至少一条中文文字'); return; }
+    const texts = raw.split('\\n').map(l => l.trim()).filter(Boolean);
+    if (!texts.length) { alert('请输入有效内容'); return; }
+    fd.append('texts', JSON.stringify(texts));
+  }
 
   const btn = document.getElementById('translateBtn');
   btn.disabled = true; btn.textContent = '翻译中...';
@@ -730,12 +969,6 @@ async function startTranslation() {
   document.getElementById('resultCard').classList.remove('show');
   document.getElementById('logBox').innerHTML = '';
   resultBlob = null;
-
-  const fd = new FormData();
-  fd.append('api_key', apiKey);
-  fd.append('provider', currentProvider);
-  fd.append('model', model);
-  fd.append('file', selectedFile);
 
   try {
     const resp = await fetch('/translate-stream', { method: 'POST', body: fd });
@@ -784,7 +1017,7 @@ function handle(evt) {
     case 'fatal':
       log('严重错误: ' + evt.message, 'err');
       document.getElementById('progressLabel').textContent = '❌ 翻译失败';
-      document.getElementById('translateBtn').disabled = false;
+      document.getElementById('translateBtn').disabled    = false;
       document.getElementById('translateBtn').textContent = '✨ 开始翻译';
       break;
     case 'done':
